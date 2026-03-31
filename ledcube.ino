@@ -1,0 +1,844 @@
+#include <Adafruit_NeoPixel.h>
+#include <WiFi.h>
+#include "esp_sntp.h"
+
+#define MAX(a,b) ( ((a)>(b)) ? (a) : (b) )
+#define MIN(a,b) ( ((a)>(b)) ? (b) : (a) )
+#define ADD8(a,b) (uint8_t)(((uint16_t)((a)+(b)) > 255) ? 255 : (a)+(b))
+#define SUB8(a,b) (uint8_t)(((int16_t)((a)-(b)) < 0) ? 0 : (a)-(b))
+
+#define PIXEL_COUNT 12
+#define PIXEL_PIN   D10
+
+#define BUTTON_R_PIN D0
+#define BUTTON_G_PIN D1
+#define BUTTON_B_PIN D3
+#define BUTTON_K_PIN D4
+#define BUTTON_W_PIN D8
+
+enum {
+  BUTTON_R,
+  BUTTON_G,
+  BUTTON_B,
+  BUTTON_K,
+  BUTTON_W,
+  BUTTON_COUNT
+};
+
+#define BUTTON_DEBOUNCE_MS  50  //ms for debounce
+#define BUTTON_HOLD_MS      500 //ms below which a button is "pressed" and above which is "held"
+#define BUTTON_DECAY_MS     60  //ms to coalesce multiple button events into a single message
+
+typedef enum {
+  BUTTON_IDLE,          //Button is doing nothing
+  BUTTON_PRESS,         //Button was pressed (and released) as a single-click
+  BUTTON_HOLD_START,    //Button hold started
+  BUTTON_HOLD,          //Button is held (only sent with other events)
+  BUTTON_HOLD_RELEASE,  //Button hold was released
+} button_event_t;
+
+// Define Queue 
+QueueHandle_t qButton;
+const int qButtonSize = 10;
+typedef struct {
+  button_event_t evt[BUTTON_COUNT];  
+} qbutton_msg_t;
+
+// Define pixel ring
+Adafruit_NeoPixel pixels(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+typedef struct {
+  uint16_t h;
+  uint8_t  s;
+  uint8_t  v;
+} color_hsv_t;
+
+typedef struct {
+  uint8_t h;
+  uint8_t m;
+  uint8_t s;
+} clocktime_t;
+
+// Define button pins
+const uint32_t button_pin[BUTTON_COUNT] = {BUTTON_R_PIN, BUTTON_G_PIN, BUTTON_B_PIN, BUTTON_K_PIN, BUTTON_W_PIN};
+
+// Eastern Time POSIX TZ String
+// EST+5: Eastern Standard Time is UTC-5
+// EDT+4: Eastern Daylight Time is UTC-4
+// M3.2.0/02:00:00: DST starts 2nd Sunday in March at 2AM
+// M11.1.0/02:00:00: DST ends 1st Sunday in November at 2AM
+const char* TZ_STRING = "EST5EDT4,M3.2.0/02:00:00,M11.1.0/02:00:00"; 
+
+uint32_t left_pixel(uint32_t p)
+{
+  if (p == 0)
+  {
+    return PIXEL_COUNT-1;
+  }
+  else
+  {
+    return p-1;
+  }
+}
+
+uint32_t right_pixel(uint32_t p)
+{
+  return (p+1) % PIXEL_COUNT;
+}
+
+void taskButtonHandler(void *pvParameters) {
+  Serial.println("Started the button task");
+  
+  uint32_t p;
+  qbutton_msg_t msg = {.evt={BUTTON_IDLE,BUTTON_IDLE,BUTTON_IDLE,BUTTON_IDLE,BUTTON_IDLE}};
+  uint32_t decayStart = 0;
+
+  struct {
+    uint32_t lastTime;    //Time since last state change, for debounce
+    uint32_t startTime;   //Time since button was pressed, for press/hold
+    uint32_t lastState;   //Last state of button, for debounce
+    uint32_t currState;   //Current (valid) state of button
+    bool     hold;        //If currently in a hold or not
+  } button_state[BUTTON_COUNT];
+
+  for (p=0; p<BUTTON_COUNT; p++)
+  {
+    button_state[p].lastTime = 0;
+    button_state[p].startTime = 0;
+    button_state[p].lastState = HIGH;
+    button_state[p].currState = HIGH;  
+    button_state[p].hold = false;  
+  }
+    
+  for (;;) {
+    bool send = false;
+
+    //Debounce
+    unsigned long now = millis();  
+    for (p=0; p<BUTTON_COUNT; p++)
+    {    
+      int reading = digitalRead(button_pin[p]);
+      if (reading != button_state[p].lastState)
+      {
+        button_state[p].lastTime = now;
+      }
+
+      if ((now - button_state[p].lastTime) > BUTTON_DEBOUNCE_MS)
+      {
+        if (reading != button_state[p].currState)
+        {
+          //A button has changed state
+          button_state[p].currState = reading;
+
+          if (reading == LOW)
+          {
+            //The button is now pressed
+            button_state[p].startTime = now;
+          }
+          else 
+          {
+            //The button was released            
+            if (button_state[p].hold)
+            {
+              button_state[p].hold = false;
+              msg.evt[p] = BUTTON_HOLD_RELEASE;    
+              send = true;          
+            }
+            else
+            {
+              msg.evt[p] = BUTTON_PRESS;
+              send = true;
+            }
+          }
+        }
+      }
+
+      //Check if we've started a hold
+      if ((button_state[p].currState == LOW) && ((now - button_state[p].startTime) >= BUTTON_HOLD_MS))
+      {
+        if (!button_state[p].hold)
+        {
+          msg.evt[p] = BUTTON_HOLD_START;
+          send = true;    
+          button_state[p].hold = true;
+        }      
+      }
+
+      button_state[p].lastState = reading;
+    }
+
+    /* TODO: There should be a decay timer as well, to collect events for up to x milliseconds so we send only a single message if a user releases two buttons */
+
+    if (send)
+    {
+      decayStart = now;
+    }
+
+    if ((decayStart > 0) && ((now - decayStart) >= BUTTON_DECAY_MS))
+    {
+      //Reset the decay clock
+      decayStart = 0;
+      
+      //If we're otherwise sending a message, any button currently in a hold should report that
+      for (p=0; p<BUTTON_COUNT; p++) {
+        if (button_state[p].hold && msg.evt[p] == BUTTON_IDLE) {
+          msg.evt[p] = BUTTON_HOLD;
+        }
+      }   
+
+      int ret = xQueueSend(qButton, (void *)&msg, 0);
+      if (ret == pdTRUE) {
+        // The message was successfully sent.
+      } else if (ret == errQUEUE_FULL) {
+        // Since we are checking uxQueueSpacesAvailable this should not occur, however if more than one task should
+        //   write into the same queue it can fill-up between the test and actual send attempt
+        Serial.println("The `taskButtonHandler` was unable to send data into the Queue");
+      }  // Queue send check
+
+      memset(&msg, 0, sizeof(msg));
+    }
+
+    vTaskDelay(10);
+  }
+}
+
+typedef enum
+{ 
+  IDLE, 
+  ATTACK, 
+  DECAY,
+} starmode_t;
+
+void animate_night(bool valid, button_event_t *evt)
+{
+  static bool initialized     = false;
+  static uint32_t time        = 0;
+  static const uint32_t delay_ms     = 100;
+  static const uint32_t num_stars    = 3;
+  static const uint32_t pct_new_star = 4; //Percentage chance of a new star birth
+  static const uint32_t colors       = 30;
+  static const uint32_t palette[] = {
+    0x0a000f,
+    0x110816,
+    0x19101d,
+    0x201725,
+    0x281f2c,
+    0x2f2733,
+    0x362f3a,
+    0x3e3642,
+    0x453e49,
+    0x4d4650,
+    0x544e57,
+    0x5c555f,
+    0x635d66,
+    0x6a656d,
+    0x726d74,
+    0x79747c,
+    0x817c83,
+    0x88848a,
+    0x8f8c91,
+    0x979399,
+    0x9e9ba0,
+    0xa6a3a7,
+    0xadabae,
+    0xb5b2b6,
+    0xbcbabd,
+    0xc3c2c4,
+    0xcbcacb,
+    0xd2d1d3,
+    0xdad9da,
+    0xe1e1e1,
+  };
+
+  static struct {
+    int32_t color = 0; //allow signed to go less than zero
+    uint32_t max = 0;
+    uint32_t attack = 0;
+    uint32_t decay = 0;
+    starmode_t mode;
+    uint32_t idx = 0;
+  } stars[num_stars];
+  
+  uint32_t pixval[PIXEL_COUNT] = {0};
+  uint32_t i;
+
+  // First run initialize
+  if (!initialized)
+  {
+    initialized = true;
+    time = millis();
+    for (i=0; i<num_stars; i++)
+    {
+      stars[i].mode = IDLE;
+      stars[i].color = 0;
+      stars[i].max = 0;
+      stars[i].idx = 0;
+    }
+    Serial.println("Initialized the Night.");
+  }
+
+  // Iterate
+  uint32_t now = millis();
+  if (now - time >= delay_ms)
+  {
+    time = now;
+
+    //Initialize pixel array in the base color (it will be redrawn after iterating)
+    for (uint32_t i=0; i<PIXEL_COUNT; i++)
+    {
+      pixval[i] = 0;
+    }
+    // Serial.println("Reset the Pixels");
+
+    //Advance the stars array:
+    // If a star is active, step its mode
+    // If no star is active, maybe create one;
+    for (int i=0; i<num_stars; i++)
+    { 
+      if (stars[i].mode == IDLE)
+      {
+        //Star is idle; maybe birth one
+        if (random(100) < pct_new_star)
+        {
+          stars[i].mode = ATTACK;
+          stars[i].color = 0;
+          stars[i].max = random(colors);
+          stars[i].idx = random(PIXEL_COUNT);
+          stars[i].decay = 1+random(3); //decay will always be slower than attack
+          stars[i].attack = stars[i].decay+random(5);
+          // Serial.printf("New Star at %d: max %d\n", stars[i].idx, stars[i].max);
+        }
+      }
+      else
+      {
+        //advance an existing star
+        if (stars[i].mode == ATTACK)
+        {
+          stars[i].color += stars[i].attack;
+          if (stars[i].color >= stars[i].max)
+          {
+            stars[i].color = stars[i].max;
+            stars[i].mode = DECAY;
+          }
+        }
+        else if (stars[i].mode == DECAY)
+        {
+          stars[i].color -= stars[i].decay;
+          if (stars[i].color <= 0)
+          {
+            stars[i].color = 0;
+            stars[i].mode = IDLE;
+          }
+
+        } 
+
+        pixval[stars[i].idx] = MAX(stars[i].color, pixval[stars[i].idx]); //star
+        pixval[left_pixel(stars[i].idx)] = MAX(stars[i].color/10, pixval[left_pixel(stars[i].idx)]); //left bleed
+        pixval[right_pixel(stars[i].idx)] = MAX(stars[i].color/10, pixval[right_pixel(stars[i].idx)]); //right bleed
+      }
+      
+      // Serial.printf("Star %d: idx %d, mode %d, color %d, max %d\n",
+      //   i,
+      //   stars[i].idx,
+      //   stars[i].mode,
+      //   stars[i].color,
+      //   stars[i].max);
+    }
+
+    // Draw
+    // Serial.printf("@%d Draw.\n", time);
+    for (i=0; i<PIXEL_COUNT; i++)
+    {
+      pixels.setPixelColor(i, palette[pixval[i]]);
+    }
+    pixels.show();
+  }
+
+}
+
+void animate_day(bool valid, button_event_t *evt)
+{
+  static bool initialized     = false;
+  static uint32_t time        = 0;
+  static const uint32_t delay_ms     = 500;
+  static const uint32_t num_stars    = 4;
+  static const uint32_t pct_new_star = 15; //Percentage chance of a new cloud birth
+  static const uint32_t colors       = 30;
+  static const uint32_t palette[] = {
+    0x2b80e5,
+    0x3284e6,
+    0x3a89e7,
+    0x418de8,
+    0x4892e9,
+    0x5096e9,
+    0x579aea,
+    0x5e9feb,
+    0x65a3ec,
+    0x6da7ed,
+    0x74acee,
+    0x7bb0ef,
+    0x83b5f0,
+    0x8ab9f1,
+    0x91bdf2,
+    0x99c2f2,
+    0xa0c6f3,
+    0xa7caf4,
+    0xafcff5,
+    0xb6d3f6,
+    0xbdd8f7,
+    0xc5dcf8,
+    0xcce0f9,
+    0xd3e5fa,
+    0xdae9fb,
+    0xe2edfb,
+    0xe9f2fc,
+    0xf0f6fd,
+    0xf8fbfe,
+    0xffffff,
+  };
+
+  static struct {
+    int32_t color = 0; //allow signed to go less than zero
+    uint32_t max = 0;
+    uint32_t attack = 0;
+    uint32_t decay = 0;
+    starmode_t mode;
+    uint32_t idx = 0;
+  } stars[num_stars];
+  
+  uint32_t pixval[PIXEL_COUNT] = {0};
+  uint32_t i;
+
+  // First run initialize
+  if (!initialized)
+  {
+    initialized = true;
+    time = millis();
+    for (i=0; i<num_stars; i++)
+    {
+      stars[i].mode = IDLE;
+      stars[i].color = 0;
+      stars[i].max = 0;
+      stars[i].idx = 0;
+    }
+    Serial.println("Initialized the Day.");
+  }
+
+  // Iterate
+  uint32_t now = millis();
+  if (now - time >= delay_ms)
+  {
+    time = now;
+
+    //Initialize pixel array in the base color (it will be redrawn after iterating)
+    for (uint32_t i=0; i<PIXEL_COUNT; i++)
+    {
+      pixval[i] = 0;
+    }
+    // Serial.println("Reset the Pixels");
+
+    //Advance the stars array:
+    // If a star is active, step its mode
+    // If no star is active, maybe create one;
+    for (int i=0; i<num_stars; i++)
+    { 
+      if (stars[i].mode == IDLE)
+      {
+        //Star is idle; maybe birth one
+        if (random(100) < pct_new_star)
+        {
+          stars[i].mode = ATTACK;
+          stars[i].color = 0;
+          stars[i].max = random(colors);
+          stars[i].idx = random(PIXEL_COUNT);
+          stars[i].decay = 1+random(3);
+          stars[i].attack = stars[i].decay; //1+random(3);
+          // Serial.printf("New Star at %d: max %d\n", stars[i].idx, stars[i].max);
+        }
+      }
+      else
+      {
+        //advance an existing star
+        if (stars[i].mode == ATTACK)
+        {
+          stars[i].color += stars[i].attack;
+          if (stars[i].color >= stars[i].max)
+          {
+            stars[i].color = stars[i].max;
+            stars[i].mode = DECAY;
+          }
+        }
+        else if (stars[i].mode == DECAY)
+        {
+          stars[i].color -= stars[i].decay;
+          if (stars[i].color <= 0)
+          {
+            stars[i].color = 0;
+            stars[i].mode = IDLE;
+          }
+
+        } 
+
+        pixval[stars[i].idx] = MAX(stars[i].color, pixval[stars[i].idx]); //star
+        pixval[left_pixel(stars[i].idx)] = MAX(stars[i].color/5, pixval[left_pixel(stars[i].idx)]); //left bleed
+        pixval[right_pixel(stars[i].idx)] = MAX(stars[i].color/5, pixval[right_pixel(stars[i].idx)]); //right bleed
+        pixval[left_pixel(left_pixel(stars[i].idx))] = MAX(stars[i].color/10, pixval[left_pixel(left_pixel(stars[i].idx))]); //left bleed 2
+        pixval[right_pixel(right_pixel(stars[i].idx))] = MAX(stars[i].color/10, pixval[right_pixel(right_pixel(stars[i].idx))]); //right bleed 2
+      }
+      
+      // Serial.printf("Star %d: idx %d, mode %d, color %d, max %d\n",
+      //   i,
+      //   stars[i].idx,
+      //   stars[i].mode,
+      //   stars[i].color,
+      //   stars[i].max);
+    }
+
+    // Draw
+    // Serial.printf("@%d Draw.\n", time);
+    for (i=0; i<PIXEL_COUNT; i++)
+    {
+      pixels.setPixelColor(i, palette[pixval[i]]);
+    }
+    pixels.show();
+  }
+
+}
+
+typedef enum {
+  MODE_NIGHT,
+  MODE_DAY,
+  MODE_PALETTE,
+  MODE_CLOCK,
+  MODE_COUNT,
+} led_mode_t;
+
+typedef enum {
+  MODE_DISPLAY,
+  MODE_R,
+  MODE_G,
+  MODE_B,
+} palette_mode_t;
+
+void animate_palette(bool valid, button_event_t *evt)
+{
+  static bool initialized     = false;
+  static uint32_t time        = 0;
+  static const uint32_t reset_ms = 2000; //Time to reset to pure color mode (from control mode)  
+  static struct {
+    uint8_t R;
+    uint8_t G;
+    uint8_t B;
+  } color;
+  static palette_mode_t mode;
+
+  if (!initialized)
+  {
+    initialized = true;
+    time = millis();
+    mode = MODE_DISPLAY;
+    color.R = 0;
+    color.G = 0;
+    color.B = 0;
+    pixels.fill(0, 0, PIXEL_COUNT);
+    pixels.show();    
+    Serial.println("Initialized the Palette.");
+  }
+
+  uint32_t now = millis();
+  bool update = false;
+
+  //Check buttons and act accordingly
+  if (valid)
+  {
+    if (evt[BUTTON_R] == BUTTON_PRESS)
+    {
+      mode = MODE_R;
+    }
+    else if (evt[BUTTON_G] == BUTTON_PRESS)
+    {
+      mode = MODE_G;
+    }
+    else if (evt[BUTTON_B] == BUTTON_PRESS)
+    {
+      mode = MODE_B;
+    }
+
+    if (evt[BUTTON_W] == BUTTON_HOLD_START)
+    {
+      color.R = 255;
+      color.G = 255;
+      color.B = 255;
+      mode = MODE_DISPLAY;
+    }
+    else if (evt[BUTTON_W] == BUTTON_PRESS)
+    {
+      switch (mode)
+      {
+        case MODE_R:
+          color.R = ADD8(color.R, 8);
+          break;
+        case MODE_G:
+          color.G = ADD8(color.G, 8);
+          break;
+        case MODE_B:
+          color.B = ADD8(color.B, 8);
+          break;
+      }
+    }
+
+    if (evt[BUTTON_K] == BUTTON_PRESS)
+    {
+      switch (mode)
+      {
+        case MODE_R:
+          color.R = SUB8(color.R, 8);
+          break;
+        case MODE_G:
+          color.G = SUB8(color.G, 8);
+          break;
+        case MODE_B:
+          color.B = SUB8(color.B, 8);
+          break;
+      }
+    }
+
+    time = millis();
+    update = true;
+  }
+
+  //Reset the display if it's been a while
+  if ((mode != MODE_DISPLAY) && ((now - time) > reset_ms))
+  {
+    mode = MODE_DISPLAY;
+    update = true;
+  }
+
+  //Do the displaying
+  if (update)
+  {
+    Serial.printf("Mode is %d, color is %d %d %d\n", mode, color.R, color.G, color.B);
+    pixels.fill(pixels.Color(color.R, color.G, color.B, 0), 0, PIXEL_COUNT);
+    uint8_t count = 0;
+    switch (mode)
+    {
+      case MODE_R:
+        pixels.fill(0, 7, 5);
+        count = 5*color.R/255;
+        if (count > 0)
+        {
+          pixels.fill(0xFF0000, 7, count);
+        }
+        break;
+      case MODE_G:
+        pixels.fill(0, 7, 7);
+        count = 5*color.G/255;
+        if (count > 0)
+        {
+          pixels.fill(0x00FF00, 7, count);
+        }
+        break;
+      case MODE_B:
+        pixels.fill(0, 7, 7);
+        count = 5*color.B/255;
+        if (count > 0)
+        {
+          pixels.fill(0x0000FF, 7, count);
+        }
+        break;
+      case MODE_DISPLAY: 
+        //do nothing, we've already filled the pixels     
+      break;
+    }
+    pixels.show();
+  }
+}
+
+void get_clock(clocktime_t *tm)
+{
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+      
+    // Convert tv_sec to a local calendar time structure
+    struct tm *local_time = localtime(&tv.tv_sec);
+
+    if (local_time != NULL) {
+        tm->h = local_time->tm_hour;
+        tm->m = local_time->tm_min;
+        tm->s = local_time->tm_sec;
+    }
+}
+
+void animate_clock(bool valid, button_event_t *evt)
+{
+  static bool initialized     = false;
+  static uint32_t time        = 0;
+
+  if (!initialized)
+  {
+    initialized = true;
+    time = millis();
+    Serial.println("Initialized the Clock.");
+  }
+
+  clocktime_t clk;
+  get_clock(&clk);
+
+  bool pm = clk.h/12; // 1 if hour >= 12
+
+  uint32_t now = millis();
+  if (now - time > 100)
+  {
+    time = now;
+    
+    Serial.printf("It is %02d:%02d:%02d\n", clk.h, clk.m, clk.s);
+    if (pm)
+    {
+      pixels.fill(0, 0, PIXEL_COUNT);
+      pixels.setPixelColor(clk.h%12, 0x101010);
+      pixels.setPixelColor(clk.m/5, 0x100010);
+      pixels.show();      
+    }
+    else
+    {
+      pixels.fill(0, 0, PIXEL_COUNT);
+      pixels.setPixelColor(clk.h%12, 0x101010);
+      pixels.setPixelColor(clk.m/5, 0x201000);
+      pixels.show();      
+    }
+
+  }
+}
+
+void animate_boot()
+{
+  static bool initialized     = false;
+  static uint32_t time        = 0;
+  static uint32_t idx         = 0;
+
+  if (!initialized)
+  {
+    time = millis();
+    pixels.fill(0, 0, PIXEL_COUNT);
+    pixels.setPixelColor(idx, 0x666666);
+    pixels.show();
+  }
+
+  uint32_t now = millis();
+  if (now - time > 100)
+  {
+    time = now;
+    idx = right_pixel(idx);
+    Serial.println(idx);
+    pixels.fill(0, 0, PIXEL_COUNT);
+    pixels.setPixelColor(idx, 0x666666);
+    pixels.show();
+  }
+}
+
+void taskMain(void *pvParameters) {  // This is a task.
+  Serial.println("Started the main task");
+
+  // Set WiFi to station mode and disconnect from an AP if it was previously connected
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  WiFi.begin("308", "albemarle");
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    vTaskDelay(10);
+    animate_boot();  
+    if (millis() - start > 5000) 
+    {
+      //timeout
+      break;
+    }  
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.print("Connected ");
+    Serial.println(WiFi.localIP());
+
+    configTime(0, 0, "pool.ntp.org"); // Set 0/0 and use TZ_STRING for proper DST
+    setenv("TZ", TZ_STRING, 1);
+    tzset();
+  }
+
+  uint32_t mode = (uint32_t)MODE_NIGHT;
+  for (;;) { 
+    qbutton_msg_t msg;
+    bool valid_msg = false;
+
+    //Check the button queue
+    //the timeout here clocks the actual LED display mode also
+    int ret = xQueueReceive(qButton, &msg, 50);
+    if (ret == pdPASS) {
+      Serial.println("Got Button State");
+      Serial.println(msg.evt[0]);
+      Serial.println(msg.evt[1]);
+      Serial.println(msg.evt[2]);
+      Serial.println(msg.evt[3]);
+      Serial.println(msg.evt[4]);
+      valid_msg = true;
+
+      if (msg.evt[BUTTON_K] == BUTTON_HOLD_START)
+      {        
+        mode = (mode + 1) % MODE_COUNT;
+        Serial.printf("New Mode %d\n", mode); 
+      }
+    }
+
+    //Do whatever we're doing
+    switch ((led_mode_t)mode)
+    {
+      case MODE_NIGHT:
+        animate_night(valid_msg, msg.evt);
+        break;
+      case MODE_DAY:
+        animate_day(valid_msg, msg.evt);
+        break;
+      case MODE_PALETTE:
+        animate_palette(valid_msg, msg.evt);
+        break;
+      case MODE_CLOCK:
+        animate_clock(valid_msg, msg.evt);
+        break;
+    }
+
+
+  }  // Infinite loop
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Begin");
+  randomSeed(analogRead(A0));
+
+  // Init Button HW
+  uint32_t p;
+  for (p=0; p<5; p++)
+  {
+    pinMode(button_pin[p], INPUT_PULLUP);
+  }
+
+  // Init NeoPixel ring
+  pixels.begin();
+  pixels.fill(0xFFFFFF, 0, PIXEL_COUNT);
+  pixels.show();
+
+  //Init main Task
+  qButton = xQueueCreate(qButtonSize, sizeof(qbutton_msg_t));
+  xTaskCreate(taskMain, "main", 4096,  NULL, 1, NULL);
+
+  //Init button Task
+  xTaskCreate(taskButtonHandler, "button", 1024,  NULL, 2, NULL);
+}
+
+void loop()
+{
+  //Do nothing, FreeRTOS is on it
+  vTaskDelay(1000);
+}
