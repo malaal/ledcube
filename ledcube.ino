@@ -2,13 +2,13 @@
 #include <WiFi.h>
 #include "esp_sntp.h"
 
-#define MAX(a,b) ( ((a)>(b)) ? (a) : (b) )
-#define MIN(a,b) ( ((a)>(b)) ? (b) : (a) )
-#define ADD8(a,b) (uint8_t)(((uint16_t)((a)+(b)) > 255) ? 255 : (a)+(b))
-#define SUB8(a,b) (uint8_t)(((int16_t)((a)-(b)) < 0) ? 0 : (a)-(b))
+#define MAX(a, b) (((a) > (b)) ? (a) : (b))
+#define MIN(a, b) (((a) > (b)) ? (b) : (a))
+#define ADD8(a, b) (uint8_t)(((uint16_t)((a) + (b)) > 255) ? 255 : (a) + (b))
+#define SUB8(a, b) (uint8_t)(((int16_t)((a) - (b)) < 0) ? 0 : (a) - (b))
 
 #define PIXEL_COUNT 12
-#define PIXEL_PIN   D10
+#define PIXEL_PIN D10
 
 #define BUTTON_R_PIN D0
 #define BUTTON_G_PIN D1
@@ -25,9 +25,9 @@ enum {
   BUTTON_COUNT
 };
 
-#define BUTTON_DEBOUNCE_MS  50  //ms for debounce
-#define BUTTON_HOLD_MS      500 //ms below which a button is "pressed" and above which is "held"
-#define BUTTON_DECAY_MS     60  //ms to coalesce multiple button events into a single message
+#define BUTTON_DEBOUNCE_MS 50  //ms for debounce
+#define BUTTON_HOLD_MS 500     //ms below which a button is "pressed" and above which is "held"
+#define BUTTON_DECAY_MS 60     //ms to coalesce multiple button events into a single message
 
 typedef enum {
   BUTTON_IDLE,          //Button is doing nothing
@@ -37,11 +37,11 @@ typedef enum {
   BUTTON_HOLD_RELEASE,  //Button hold was released
 } button_event_t;
 
-// Define Queue 
+// Define Queue
 QueueHandle_t qButton;
 const int qButtonSize = 10;
 typedef struct {
-  button_event_t evt[BUTTON_COUNT];  
+  button_event_t evt[BUTTON_COUNT];
 } qbutton_msg_t;
 
 // Define pixel ring
@@ -108,28 +108,26 @@ uint32_t right_pixel(uint32_t p) {
   return (p + 1) % PIXEL_COUNT;
 }
 
-uint8_t next_color(uint8_t c, int8_t inc) 
-{
-    if (inc == 0) return c;
+uint8_t next_color(uint8_t c, int8_t inc) {
+  if (inc == 0) return c;
 
-    if (inc > 0) {
-        // Calculate the step to the next higher multiple
-        uint16_t next = (uint16_t)c + (inc - (c % inc));
-        // Clamp at 255
-        return (next > 255) ? 255 : (uint8_t)next;
-    } 
-    else {
-        // Convert to absolute to simplify math
-        uint8_t abs_inc = (uint8_t)(-inc);
-        
-        // If already at a multiple, jump down one full step
-        if (c % abs_inc == 0) {
-            return (c > abs_inc) ? (c - abs_inc) : 0;
-        }
-        
-        // Otherwise, floor to the nearest multiple (clamping at 0 happens naturally)
-        return (c / abs_inc) * abs_inc;
+  if (inc > 0) {
+    // Calculate the step to the next higher multiple
+    uint16_t next = (uint16_t)c + (inc - (c % inc));
+    // Clamp at 255
+    return (next > 255) ? 255 : (uint8_t)next;
+  } else {
+    // Convert to absolute to simplify math
+    uint8_t abs_inc = (uint8_t)(-inc);
+
+    // If already at a multiple, jump down one full step
+    if (c % abs_inc == 0) {
+      return (c > abs_inc) ? (c - abs_inc) : 0;
     }
+
+    // Otherwise, floor to the nearest multiple (clamping at 0 happens naturally)
+    return (c / abs_inc) * abs_inc;
+  }
 }
 
 void taskButtonHandler(void *pvParameters) {
@@ -686,31 +684,39 @@ void animate_palette(bool valid, button_event_t *evt) {
   }
 
   //Do a hold color change
-  if ((now - time) > 500) 
-  {
-    switch (mode) 
-    {
+  if ((now - time) > 500) {
+    switch (mode) {
       case MODE_RW:
         color.R = next_color(color.R, 8);
+        time = now;
+        update = true;
         break;
       case MODE_GW:
         color.G = next_color(color.G, 8);
+        time = now;
+        update = true;
         break;
       case MODE_BW:
         color.B = next_color(color.B, 8);
+        time = now;
+        update = true;
         break;
       case MODE_RK:
         color.R = next_color(color.R, -8);
+        time = now;
+        update = true;
         break;
       case MODE_GK:
         color.G = next_color(color.G, -8);
+        time = now;
+        update = true;
         break;
       case MODE_BK:
         color.B = next_color(color.B, -8);
+        time = now;
+        update = true;
         break;
     }
-    time = now;
-    update = true;
   }
 
   //Reset the display if it's been a while (and we're not doing a button-hold operation)
@@ -723,34 +729,31 @@ void animate_palette(bool valid, button_event_t *evt) {
   if (update) {
     Serial.printf("Mode is %d, color is %d %d %d\n", mode, color.R, color.G, color.B);
     pixels.fill(pixels.Color(color.R, color.G, color.B, 0), 0, PIXEL_COUNT);
-    uint8_t count = 0;
+    uint16_t bar = 0;
     switch (mode) {
       case MODE_R:
       case MODE_RW:
       case MODE_RK:
         pixels.fill(0, 7, 5);
-        count = 5 * color.R / 255;
-        if (count > 0) {
-          pixels.fill(0xFF0000, 7, count);
-        }
+        bar = color.R * 5 + 5;
+        if ((bar >> 8) > 0) pixels.fill(0xFF0000, 7, bar >> 8);
+        pixels.setPixelColor(7 + (bar >> 8), (bar & 0xFF) << 16);
         break;
       case MODE_G:
       case MODE_GW:
       case MODE_GK:
-        pixels.fill(0, 7, 7);
-        count = 5 * color.G / 255;
-        if (count > 0) {
-          pixels.fill(0x00FF00, 7, count);
-        }
+        pixels.fill(0, 7, 5);
+        bar = color.G * 5 + 5;
+        if ((bar >> 8) > 0) pixels.fill(0x00FF00, 7, bar >> 8);
+        pixels.setPixelColor(7 + (bar >> 8), (bar & 0xFF) << 8);
         break;
       case MODE_B:
       case MODE_BW:
       case MODE_BK:
-        pixels.fill(0, 7, 7);
-        count = 5 * color.B / 255;
-        if (count > 0) {
-          pixels.fill(0x0000FF, 7, count);
-        }
+        pixels.fill(0, 7, 5);
+        bar = color.B * 5 + 5;
+        if ((bar >> 8) > 0) pixels.fill(0x0000FF, 7, bar >> 8);
+        pixels.setPixelColor(7 + (bar >> 8), bar & 0xFF);
         break;
       case MODE_DISPLAY:
         //do nothing, we've already filled the pixels
@@ -793,7 +796,7 @@ void animate_clock(bool valid, button_event_t *evt) {
   if (now - time > 100) {
     time = now;
 
-    Serial.printf("It is %02d:%02d:%02d\n", clk.h, clk.m, clk.s);
+    // Serial.printf("It is %02d:%02d:%02d\n", clk.h, clk.m, clk.s);
     if (pm) {
       pixels.fill(0, 0, PIXEL_COUNT);
       pixels.setPixelColor(clk.h % 12, 0x101010);
