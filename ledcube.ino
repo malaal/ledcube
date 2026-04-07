@@ -727,7 +727,7 @@ void animate_palette(bool valid, button_event_t *evt) {
 
   //Do the displaying
   if (update) {
-    Serial.printf("Mode is %d, color is %d %d %d\n", mode, color.R, color.G, color.B);
+    Serial.printf("Mode is %d, color is %d %d %d (#%02X%02X%02X)\n", mode, color.R, color.G, color.B, color.R, color.G, color.B);
     pixels.fill(pixels.Color(color.R, color.G, color.B, 0), 0, PIXEL_COUNT);
     uint16_t bar = 0;
     switch (mode) {
@@ -737,6 +737,8 @@ void animate_palette(bool valid, button_event_t *evt) {
         pixels.fill(0, 7, 5);
         bar = color.R * 5 + 5;
         if ((bar >> 8) > 0) pixels.fill(0xFF0000, 7, bar >> 8);
+        pixels.setPixelColor(0, 0);
+        pixels.setPixelColor(6, 0);
         pixels.setPixelColor(7 + (bar >> 8), (bar & 0xFF) << 16);
         break;
       case MODE_G:
@@ -745,6 +747,8 @@ void animate_palette(bool valid, button_event_t *evt) {
         pixels.fill(0, 7, 5);
         bar = color.G * 5 + 5;
         if ((bar >> 8) > 0) pixels.fill(0x00FF00, 7, bar >> 8);
+        pixels.setPixelColor(0, 0);
+        pixels.setPixelColor(6, 0);        
         pixels.setPixelColor(7 + (bar >> 8), (bar & 0xFF) << 8);
         break;
       case MODE_B:
@@ -753,6 +757,8 @@ void animate_palette(bool valid, button_event_t *evt) {
         pixels.fill(0, 7, 5);
         bar = color.B * 5 + 5;
         if ((bar >> 8) > 0) pixels.fill(0x0000FF, 7, bar >> 8);
+        pixels.setPixelColor(0, 0);
+        pixels.setPixelColor(6, 0);        
         pixels.setPixelColor(7 + (bar >> 8), bar & 0xFF);
         break;
       case MODE_DISPLAY:
@@ -804,8 +810,8 @@ void animate_clock(bool valid, button_event_t *evt) {
       pixels.show();
     } else {
       pixels.fill(0, 0, PIXEL_COUNT);
-      pixels.setPixelColor(clk.h % 12, 0x101010);
-      pixels.setPixelColor(clk.m / 5, 0x201000);
+      pixels.setPixelColor(clk.h % 12, 0x201000);
+      pixels.setPixelColor(clk.m / 5, 0x100200);
       pixels.show();
     }
   }
