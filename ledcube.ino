@@ -590,9 +590,18 @@ void animate_palette(bool valid, button_event_t *evt) {
 
     if (mode == MODE_DISPLAY) {
       if (evt[BUTTON_W] == BUTTON_HOLD_START) {
-        color.R = 0;
-        color.G = 0;
-        color.B = 0;
+        if ((color.R == 0) && (color.G == 0) && (color.B == 0))
+        {
+          color.R = 255;
+          color.G = 255;
+          color.B = 255;
+        }
+        else
+        {
+          color.R = 0;
+          color.G = 0;
+          color.B = 0;
+        }
         mode = MODE_DISPLAY;
       }
     } else {
@@ -684,7 +693,7 @@ void animate_palette(bool valid, button_event_t *evt) {
   }
 
   //Do a hold color change
-  if ((now - time) > 500) {
+  if ((now - time) > 250) {
     switch (mode) {
       case MODE_RW:
         color.R = next_color(color.R, 8);
